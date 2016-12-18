@@ -1,19 +1,7 @@
 package hudson.plugins.openstf;
 
-import static hudson.plugins.android_emulator.AndroidEmulator.log;
-
-import hudson.EnvVars;
-import hudson.Extension;
-import hudson.FilePath;
-import hudson.Launcher;
-import hudson.Proc;
-import hudson.Util;
-import hudson.model.AbstractBuild;
-import hudson.model.AbstractProject;
-import hudson.model.BuildListener;
-import hudson.model.Computer;
-import hudson.model.Node;
-import hudson.model.Result;
+import hudson.*;
+import hudson.model.*;
 import hudson.plugins.android_emulator.AndroidEmulator;
 import hudson.plugins.android_emulator.SdkInstallationException;
 import hudson.plugins.android_emulator.SdkInstaller;
@@ -24,11 +12,7 @@ import hudson.plugins.openstf.util.Utils;
 import hudson.remoting.Callable;
 import hudson.tasks.BuildWrapper;
 import hudson.tasks.BuildWrapperDescriptor;
-import hudson.util.ArgumentListBuilder;
-import hudson.util.ComboBoxModel;
-import hudson.util.FormValidation;
-import hudson.util.ListBoxModel;
-import hudson.util.NullStream;
+import hudson.util.*;
 import io.swagger.client.model.DeviceListResponseDevices;
 import jenkins.model.Jenkins;
 import net.sf.json.JSONArray;
@@ -38,14 +22,14 @@ import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.bind.JavaScriptMethod;
 
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.IOException;
-import java.io.OutputStream;
-import java.io.PrintStream;
+import java.io.*;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+
+import static hudson.plugins.android_emulator.AndroidEmulator.log;
 
 public class STFBuildWrapper extends BuildWrapper {
 
@@ -171,18 +155,17 @@ public class STFBuildWrapper extends BuildWrapper {
         new AndroidRemoteContext(build, launcher, listener, androidSdk);
 
     try {
-      String reservedDeviceId = stfConfig.reserve();
-      DeviceListResponseDevices device = Utils.getSTFDeviceById(reservedDeviceId);
-      remote.setDevice(device);
-      log(logger, Messages.SHOW_RESERVED_DEVICE_INFO(device.name, device.serial,
-          device.sdk, device.version));
-      build.addAction(new STFReservedDeviceAction(descriptor.stfApiEndpoint, device));
+      List<String> reservedDeviceIds = stfConfig.reserve();
+      for (String reservedDeviceId : reservedDeviceIds) {
+          DeviceListResponseDevices device = Utils.getSTFDeviceById(reservedDeviceId);
+          remote.addDevice(device);
+          log(logger, Messages.SHOW_RESERVED_DEVICE_INFO(device.name, device.serial,
+                device.sdk, device.version));
+          build.addAction(new STFReservedDeviceAction(descriptor.stfApiEndpoint, device));
+      }
     } catch (STFException ex) {
       log(logger, ex.getMessage());
-      build.setResult(Result.NOT_BUILT);
-      if (remote.getDevice() != null) {
-        cleanUp(stfConfig, remote);
-      }
+      cleanUp(remote);
       return null;
     }
 
@@ -193,7 +176,7 @@ public class STFBuildWrapper extends BuildWrapper {
       } catch (IOException ex) {
         log(logger, Messages.CANNOT_CREATE_ADBKEY_FILE());
         build.setResult(Result.NOT_BUILT);
-        cleanUp(stfConfig, remote);
+        cleanUp(remote);
         return null;
       }
     }
@@ -213,14 +196,9 @@ public class STFBuildWrapper extends BuildWrapper {
     if (workspace == null) {
       log(logger, Messages.CANNOT_GET_WORKSPACE_ON_THIS_BUILD());
       build.setResult(Result.FAILURE);
-      cleanUp(stfConfig, remote);
+      cleanUp(remote);
       return null;
     }
-    final FilePath logcatFile = workspace.createTextTempFile("logcat_", ".log", "", false);
-    final OutputStream logcatStream = logcatFile.write();
-    final String logcatArgs = String.format("-s %s logcat -v time", remote.serial());
-    final Proc logWriter = remote.getToolProcStarter(Tool.ADB, logcatArgs)
-        .stdout(logcatStream).stderr(new NullStream()).start();
 
     // Make sure we're still connected
     connect(remote);
@@ -232,7 +210,7 @@ public class STFBuildWrapper extends BuildWrapper {
     if (!connectSucceeded) {
       log(logger, Messages.CONNECTING_STF_DEVICE_FAILED());
       build.setResult(Result.FAILURE);
-      cleanUp(stfConfig, remote);
+      cleanUp(remote);
       return null;
     }
 
@@ -242,10 +220,10 @@ public class STFBuildWrapper extends BuildWrapper {
     return new Environment() {
       @Override
       public void buildEnvVars(Map<String, String> env) {
-        env.put("ANDROID_SERIAL", remote.serial());
-        env.put("ANDROID_AVD_DEVICE", remote.serial());
+//        env.put("ANDROID_SERIAL", remote.serial());
+//        env.put("ANDROID_AVD_DEVICE", remote.serial());
         env.put("ANDROID_ADB_SERVER_PORT", Integer.toString(remote.adbServerPort()));
-        env.put("ANDROID_TMP_LOGCAT_FILE", logcatFile.getRemote());
+//        env.put("ANDROID_TMP_LOGCAT_FILE", logcatFile.getRemote());
         if (androidSdk.hasKnownRoot()) {
           env.put("JENKINS_ANDROID_HOME", androidSdk.getSdkRoot());
           env.put("ANDROID_HOME", androidSdk.getSdkRoot());
@@ -260,8 +238,26 @@ public class STFBuildWrapper extends BuildWrapper {
       @Override
       public boolean tearDown(AbstractBuild build, BuildListener listener)
           throws IOException, InterruptedException {
+        for (String serial : remote.serials()) {
+          final FilePath logcatFile = workspace.createTextTempFile("logcat_"+serial, ".log", "", false);
+          final OutputStream logcatStream = logcatFile.write();
+          final String logcatArgs = String.format("-s %s logcat -v time",serial);
+          final Proc logWriter = remote.getToolProcStarter(Tool.ADB, logcatArgs)
+                  .stdout(logcatStream).stderr(new NullStream()).start();
+          cleanUp(remote.logger(), logWriter, logcatFile, logcatStream, artifactsDir, serial);
+        }
+        // Disconnect STF device from adb
+        disconnect(remote);
+        ArgumentListBuilder adbKillCmd = remote.getToolCommand(Tool.ADB, "kill-server");
+        remote.getProcStarter(adbKillCmd).join();
 
-        cleanUp(stfConfig, remote, logWriter, logcatFile, logcatStream, artifactsDir);
+        remote.cleanUp();
+
+        try {
+          stfConfig.release(remote.getDevices());
+        } catch (STFException ex) {
+          log(remote.logger(), ex.getMessage());
+        }
         return true;
       }
     };
@@ -270,37 +266,38 @@ public class STFBuildWrapper extends BuildWrapper {
   private static void connect(AndroidRemoteContext remote)
       throws IOException, InterruptedException {
 
-    ArgumentListBuilder adbConnectCmd = remote
-        .getToolCommand(Tool.ADB, "connect " + remote.serial());
-    remote.getProcStarter(adbConnectCmd).start()
-        .joinWithTimeout(5L, TimeUnit.SECONDS, remote.launcher().getListener());
+    for (String serial : remote.serials()) {
+      ArgumentListBuilder adbConnectCmd = remote
+              .getToolCommand(Tool.ADB, "connect " + serial);
+      remote.getProcStarter(adbConnectCmd).start()
+              .joinWithTimeout(5L, TimeUnit.SECONDS, remote.launcher().getListener());
+    }
+
   }
 
   private static void disconnect(AndroidRemoteContext remote)
       throws IOException, InterruptedException {
-    final String args = "disconnect " + remote.serial();
-    ArgumentListBuilder adbDisconnectCmd = remote.getToolCommand(Tool.ADB, args);
-    remote.getProcStarter(adbDisconnectCmd).start()
-        .joinWithTimeout(5L, TimeUnit.SECONDS, remote.launcher().getListener());
-  }
-
-  private void cleanUp(STFConfig stfConfig, AndroidRemoteContext remote)
-    throws IOException, InterruptedException {
-    cleanUp(stfConfig, remote, null, null, null, null);
-  }
-
-  private void cleanUp(STFConfig stfConfig, AndroidRemoteContext remote, Proc logcatProcess,
-      FilePath logcatFile, OutputStream logcatStream, File artifactsDir)
-      throws IOException, InterruptedException {
-
-    // Disconnect STF device from adb
-    disconnect(remote);
-
-    try {
-      stfConfig.release(remote.getDevice());
-    } catch (STFException ex) {
-      log(remote.logger(), ex.getMessage());
+    for (String serial : remote.serials()) {
+      final String args = "disconnect " + serial;
+      ArgumentListBuilder adbDisconnectCmd = remote.getToolCommand(Tool.ADB, args);
+      remote.getProcStarter(adbDisconnectCmd).start()
+              .joinWithTimeout(5L, TimeUnit.SECONDS, remote.launcher().getListener());
     }
+  }
+
+  private void cleanUp(AndroidRemoteContext remote)
+    throws IOException, InterruptedException {
+
+    ArgumentListBuilder adbKillCmd = remote.getToolCommand(Tool.ADB, "kill-server");
+    remote.getProcStarter(adbKillCmd).join();
+
+    remote.cleanUp();
+
+  }
+
+  private void cleanUp(PrintStream logger, Proc logcatProcess,
+                       FilePath logcatFile, OutputStream logcatStream, File artifactsDir, String serial)
+      throws IOException, InterruptedException {
 
     // Clean up logging process
     if (logcatProcess != null) {
@@ -322,16 +319,11 @@ public class STFBuildWrapper extends BuildWrapper {
 
       // Archive the logs
       if (logcatFile.length() != 0) {
-        log(remote.logger(), hudson.plugins.android_emulator.Messages.ARCHIVING_LOG());
-        logcatFile.copyTo(new FilePath(artifactsDir).child("logcat.txt"));
+        log(logger, hudson.plugins.android_emulator.Messages.ARCHIVING_LOG());
+        logcatFile.copyTo(new FilePath(artifactsDir).child("logcat_"+serial+".txt"));
       }
       logcatFile.delete();
     }
-
-    ArgumentListBuilder adbKillCmd = remote.getToolCommand(Tool.ADB, "kill-server");
-    remote.getProcStarter(adbKillCmd).join();
-
-    remote.cleanUp();
   }
 
   private String isConfigValid(String stfApiEndpoint, boolean ignoreCertError, String stfToken) {
@@ -367,10 +359,19 @@ public class STFBuildWrapper extends BuildWrapper {
         String devicesResult = out.toString(Utils.getDefaultCharset().displayName());
         String lineSeparator =
             Computer.currentComputer().getSystemProperties().get("line.separator").toString();
+        HashSet<String> serials = new HashSet<>(remote.serials());
         for (String line: devicesResult.split(lineSeparator)) {
           if (line != null) {
-            if (line.contains(remote.serial()) && line.contains("device")) {
-              return true;
+            if (line.contains("device")) {
+              Iterator<String> iterator = serials.iterator();
+              while (iterator.hasNext()) {
+                if(line.contains(iterator.next())) {
+                  iterator.remove();
+                }
+              }
+              if (serials.isEmpty()) {
+                return true;
+              }
             }
           }
         }

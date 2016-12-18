@@ -21,6 +21,7 @@ import java.io.OutputStreamWriter;
 import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
@@ -50,9 +51,9 @@ class STFConfig implements Serializable {
     return useSpecificKey;
   }
 
-  public String reserve() throws STFException, InterruptedException {
+  public List<String> reserve() throws STFException, InterruptedException {
     JSONObject filter = JSONObject.fromObject(stfDeviceFilterString);
-    DeviceListResponseDevices reservedDevice = null;
+//    DeviceListResponseDevices reservedDevice = null;
     filter.put("present", true);
 
     List<DeviceListResponseDevices> deviceList = Utils.getDeviceList(filter);
@@ -87,32 +88,34 @@ class STFConfig implements Serializable {
     }
 
     Collections.shuffle(deviceList);
-
+    List<String> serials = new ArrayList<>();
     for (DeviceListResponseDevices device: deviceList) {
 
       try {
-        Utils.reserveSTFDevice(device);
-        reservedDevice = device;
-        break;
+        if (device!=null) {
+          Utils.reserveSTFDevice(device);
+          serials.add(device.serial);
+          // Wati for system reflects
+          Thread.sleep(5 * 1000);
+          Utils.remoteConnectSTFDevice(device);
+        }
       } catch (ApiFailedException ex) {
-        //ignore
+        ex.printStackTrace();
       }
     }
 
-    if (reservedDevice == null) {
+    if (serials.isEmpty()) {
       throw new ApiFailedException("POST /api/v1/user/devices API failed");
     }
 
-    // Wati for system reflects
-    Thread.sleep(5 * 1000);
-    Utils.remoteConnectSTFDevice(reservedDevice);
-
-    return reservedDevice.serial;
+    return serials;
   }
 
-  public void release(DeviceListResponseDevices device) throws STFException {
-    Utils.remoteDisconnectSTFDevice(device);
-    Utils.releaseSTFDevice(device);
+  public void release(List<DeviceListResponseDevices> devices) throws STFException {
+    for (DeviceListResponseDevices device : devices) {
+      Utils.remoteDisconnectSTFDevice(device);
+      Utils.releaseSTFDevice(device);
+    }
   }
 
   public Callable<Boolean, IOException> getAdbKeySettingTask(BuildListener listener) {
